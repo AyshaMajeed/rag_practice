@@ -24,7 +24,7 @@ load_dotenv()
 class RAGSystem:
     def __init__(self, md_file_path=None):
         self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.default_model = os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.2:3b")
+        self.default_model = os.getenv("OLLAMA_DEFAULT_MODEL", "llama2")
         self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
         self.file_manager = FileManager()
         self.vector_store = None
@@ -38,8 +38,6 @@ class RAGSystem:
             temperature=float(os.getenv("OLLAMA_CLASSIFIER_TEMPERATURE", "0.1")),
             base_url=self.ollama_base_url
         )
-        self.answer_llm = None
-        self.answer_model_name = None
         
         # Fast pattern matching for OBVIOUS cases only
         self.simple_patterns = {
@@ -139,10 +137,10 @@ class RAGSystem:
         
             # IMPROVED CHUNKING: Headers ko zyada prioritize karo
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=600,  # Thoda chhota karo taake sections better separate ho
-                chunk_overlap=100,  # Overlap kam karo
+                chunk_size=500,  # Smaller for precision
+                chunk_overlap=50,  # Less overlap
                 length_function=len,
-                separators=["\n### ", "\n## ", "\n#### ", "\n\n", "\n", ". ", " "]  # Headers pehle
+                separators=["\n### ", "\n## ", "\n#### ", "\n\n", "\n", ". ", " "]
             )
         
             chunks = text_splitter.split_text(content)
@@ -178,19 +176,6 @@ class RAGSystem:
                     return True, pattern_type
         
         return False, None
-    
-    def fast_intent_classify(self, question, conversation_history=None):
-        text = question.lower().strip()
-        if any(word in text for word in ["summary", "overview", "high level", "main points"]):
-            return "DOCUMENT_SUMMARY"
-        if conversation_history and len(conversation_history) >= 2:
-            if any(phrase in text for phrase in ["more detail", "more details", "elaborate", "explain more", "tell me more", "what about", "clarify"]):
-                return "FOLLOWUP"
-        if not conversation_history:
-            tokens = text.split()
-            if any(token in tokens for token in ["what", "how", "when", "where", "why", "does", "do", "can", "is", "are"]):
-                return "DOCUMENT_QUERY"
-        return None
     
     def classify_with_llm(self, question, conversation_history=None):
         """
@@ -285,12 +270,12 @@ Summary:"""
         if not conversation_history or len(conversation_history) < 2:
             return ""
         
-        recent = conversation_history[-4:]
+        recent = conversation_history[-6:]
         context_parts = []
         
         for msg in recent:
             role = "User" if msg['role'] == 'user' else "Assistant"
-            context_parts.append(f"{role}: {msg['content'][:200]}")
+            context_parts.append(f"{role}: {msg['content'][:300]}")
         
         return "\n".join(context_parts)
     
@@ -340,6 +325,32 @@ Rewritten Question:"""
             print(f"⚠️ Query expansion failed: {e}")
             return question
     
+    def lock_topic_from_history(self, history):
+        """Lock topic from last relevant message to prevent switching"""
+        if not history:
+            return "current topic"
+        for msg in reversed(history):
+            if msg['role'] == 'assistant':
+                content = msg['content'].lower()
+                if 'hr' in content or 'contact' in content:
+                    return "HR contact information"
+                elif 'help desk' in content:
+                    return "help desk contact"
+                elif 'summary' in content:
+                    return "document summary"
+                elif 'leave' in content:
+                    return "leave policy"
+        return "current topic"
+
+    def fact_check_response(self, response, context):
+        """Simple fact-check to fix contradictions like Saturday availability"""
+        response_lower = response.lower()
+        context_lower = context.lower()
+        if "saturday" in response_lower and "monday-friday" in context_lower and "not available" not in response_lower:
+            return response.replace("Yes", "No").replace("available on Saturday", "not available on Saturday")
+        return response
+
+
     def query(self, question, model_name=None, conversation_history=None):
         """
         HYBRID APPROACH with QUERY EXPANSION:
@@ -362,10 +373,11 @@ Rewritten Question:"""
                 print(f"⚡ Fast match: {response_type}")
                 return self.handle_simple_response(response_type)
             
-            intent = self.fast_intent_classify(question, conversation_history)
-            if not intent:
-                intent = self.classify_with_llm(question, conversation_history)
+            # STEP 2: LLM classification for everything else (complex/ambiguous)
+            intent = self.classify_with_llm(question, conversation_history)
             print(f"🧠 LLM classified as: {intent}")
+            topic = extract_topic_from_history(conversation_history) if conversation_history else "N/A"
+            print(f"🧠 LLM Understood: Intent={intent}, Topic={topic}, Query='{question}'")
             
             # STEP 3: Handle based on classification
             if intent == 'OFFTOPIC':
@@ -382,43 +394,54 @@ Rewritten Question:"""
             # KEY FIX: Expand query with conversation context for better retrieval
             search_query = question
             if intent in ['FOLLOWUP', 'DOCUMENT_QUERY'] and conversation_history and len(conversation_history) >= 2:
-                lowered = f" {question.lower()} "
-                pronouns = [" it ", " this ", " that ", " these ", " those ", " them ", " both ", " all of them "]
-                if any(p in lowered for p in pronouns):
-                    search_query = self.expand_query_with_context(question, conversation_history)
+                search_query = self.expand_query_with_context(question, conversation_history)
+            
+            # PREPROCESS QUERY for better matching
+            if "insurance" in question.lower():
+                search_query += " health insurance policy employees"
             
             history_context = self.build_conversation_context(conversation_history)
             
-            model_to_use = model_name or self.default_model
-            if self.answer_llm is None or self.answer_model_name != model_to_use:
-                self.answer_llm = Ollama(
-                    model=model_to_use,
-                    temperature=0.1,
-                    base_url=self.ollama_base_url
-                )
-                self.answer_model_name = model_to_use
-            llm = self.answer_llm
+            # Extract topic for FOLLOWUP
+            def extract_topic_from_history(history):
+                for msg in reversed(history):
+                    if msg['role'] == 'assistant':
+                        content = msg['content'].lower()
+                        if 'summary' in content:
+                            return "document summary"
+                        elif 'insurance' in content:
+                            return "insurance policy"
+                        elif 'leave' in content:
+                            return "leave policy"
+                return "previous topic"
             
-            # Choose prompt based on intent (UPDATED TEMPLATES - EVEN STRICTER)
+            topic = extract_topic_from_history(conversation_history) if conversation_history else "previous topic"
+            
+            # Remote server use karo
+            llm = Ollama(
+                model=model_name or self.default_model,
+                temperature=0.05,  # EVEN LOWER for literal responses
+                base_url=self.ollama_base_url
+            )
+            
+            # Choose prompt based on intent (UPDATED TEMPLATES - STRICTER)
             if intent == 'FOLLOWUP' and history_context:
-                template = """You are a document assistant. User wants MORE DETAILS about previous discussion.
+                template = f"""You are a document assistant. User wants MORE DETAILS about the {topic} from our previous conversation.
 
 Previous Conversation:
-{history}
+{{history}}
 
 Relevant Document Information:
-{context}
+{{context}}
 
-Question: {question}
+Question: {{question}}
 
 INSTRUCTIONS:
-1. User wants clarification/elaboration on previous topic
-2. Look at conversation to understand WHICH topic
-3. Provide DETAILED explanation with specific numbers and facts FROM THE DOCUMENT ONLY
-4. Use simple language
-5. Be thorough but focused
-6. If information is not in the provided document context, say: "This information is not found in the document."
-7. Do NOT add external knowledge or make assumptions.
+1. Focus ONLY on the {topic} mentioned in the conversation.
+2. Provide more details from the document about that specific topic.
+3. Do NOT assume or switch to other topics like PIP or insurance unless directly related.
+4. If the topic is unclear, ask for clarification.
+5. Use simple language and be thorough.
 
 Detailed Answer:"""
             
@@ -464,31 +487,38 @@ Answer:"""
             prompt = PromptTemplate.from_template(template)
             
             # More chunks for better context (INCREASED)
-            k_value = 6 if intent == 'FOLLOWUP' else 4  # Increased further
+            k_value = 8 if intent == 'FOLLOWUP' else 6  # Increased further
             
             retriever = self.vector_store.as_retriever(
                 search_type="similarity",
                 search_kwargs={"k": k_value}
             )
             
-            # IMPROVED format_docs with BETTER relevance filter
+            # IMPROVED format_docs with BETTER relevance filter and header priority
             def format_docs(docs):
-                # Filter short chunks and prioritize those containing query keywords
                 query_keywords = set(question.lower().split())
                 relevant_docs = []
+                header_docs = []  # Chunks starting with headers
+                
                 for d in docs:
                     content = d.page_content.lower()
-                    if len(content.strip()) > 50:  # Filter short
-                        # Boost if keywords match
-                        if any(kw in content for kw in query_keywords):
+                    if len(content.strip()) > 50:
+                        # Prioritize headers
+                        if content.startswith("###") or content.startswith("##"):
+                            header_docs.append(d)
+                        # Exact keyword match for insurance/health/policy
+                        elif any(kw in content for kw in ["insurance", "health", "policy", "employee"]):
                             relevant_docs.append(d)
-                        elif len(relevant_docs) < k_value // 2:  # Fallback to some non-matching
+                        elif any(kw in content for kw in query_keywords):
+                            relevant_docs.append(d)
+                        elif len(relevant_docs) < k_value // 2:
                             relevant_docs.append(d)
                 
-                # Log retrieved chunks for debugging
-                print(f"🔍 Retrieved {len(relevant_docs)} relevant chunks for query")
+                # Combine: Headers first, then relevant
+                final_docs = header_docs + relevant_docs
+                print(f"🔍 Retrieved {len(final_docs)} relevant chunks: {[d.page_content[:50] + '...' for d in final_docs[:3]]}")
                 
-                return "\n\n---\n\n".join([d.page_content for d in relevant_docs[:k_value]])
+                return "\n\n---\n\n".join([d.page_content for d in final_docs[:k_value]])
             
             # 🔥 KEY FIX: Use expanded query for retrieval, original for generation
             if history_context:
